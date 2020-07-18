@@ -12,6 +12,7 @@ import android.content.ContentProvider;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.UriMatcher;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.AssetManager;
@@ -20,15 +21,21 @@ import android.database.MatrixCursor;
 import android.net.Uri;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import android.text.TextUtils;
-import android.util.Log;
 
+import android.os.ParcelFileDescriptor;
+import android.text.TextUtils;
+
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+
 
 public class StickerContentProvider extends ContentProvider {
 
@@ -49,6 +56,12 @@ public class StickerContentProvider extends ContentProvider {
     public static final String STICKER_FILE_NAME_IN_QUERY = "sticker_file_name";
     public static final String STICKER_FILE_EMOJI_IN_QUERY = "sticker_emoji";
     public static final String CONTENT_FILE_NAME = "contents.json";
+
+
+    public static final String KEY_STICKERPACKS = "STICKERPACKS";
+
+
+    
 
     // public static Uri AUTHORITY_URI = new Uri.Builder().scheme(ContentResolver.SCHEME_CONTENT).authority(RNWhatsAppStickersModule.getContentProviderAuthority()).appendPath(StickerContentProvider.METADATA).build();
 
@@ -115,9 +128,14 @@ public class StickerContentProvider extends ContentProvider {
     @Nullable
     @Override
     public AssetFileDescriptor openAssetFile(@NonNull Uri uri, @NonNull String mode) {
+        System.out.println("openAssetFile " + uri.toString() + " " + mode);
         final int matchCode = MATCHER.match(uri);
         if (matchCode == STICKERS_ASSET_CODE || matchCode == STICKER_PACK_TRAY_ICON_CODE) {
-            return getImageAsset(uri);
+            try {
+                return getImageAsset(uri);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
         return null;
     }
@@ -142,19 +160,35 @@ public class StickerContentProvider extends ContentProvider {
         }
     }
 
-    private synchronized void readContentFile(@NonNull Context context) {
-        try (InputStream contentsInputStream = context.getAssets().open(CONTENT_FILE_NAME)) {
-            stickerPackList = ContentFileParser.parseStickerPacks(contentsInputStream);
-        } catch (IOException | IllegalStateException e) {
-            throw new RuntimeException(CONTENT_FILE_NAME + " file has some issues: " + e.getMessage(), e);
-        }
-    }
+    // private synchronized void readContentFile(@NonNull Context context) {
+    //     try (InputStream contentsInputStream = context.getAssets().open(CONTENT_FILE_NAME)) {
+    //         stickerPackList = ContentFileParser.parseStickerPacks(contentsInputStream);
+    //     } catch (IOException | IllegalStateException e) {
+    //         throw new RuntimeException(CONTENT_FILE_NAME + " file has some issues: " + e.getMessage(), e);
+    //     }
+    // }
 
     public List<StickerPack> getStickerPackList() {
-        if (stickerPackList == null) {
-            readContentFile(Objects.requireNonNull(getContext()));
+        System.out.println("getStickerPackList");
+        try {
+            SharedPreferences sharedPreferences = getContext().getSharedPreferences("WHATSAPP_STICKERS", Context.MODE_PRIVATE);
+
+            String jsonString = sharedPreferences.getString(StickerContentProvider.STICKERS, "");
+
+            Gson gson = new Gson();
+            List<StickerPack> stickerPacks = gson.fromJson(jsonString,new TypeToken<ArrayList<StickerPack>>() {
+            }.getType());
+
+            System.out.println("getStickerPackList: "+stickerPacks.size() +" stickers: " +stickerPacks.get(0).getStickers().size());
+            if(stickerPacks == null) {
+                return (List)new ArrayList<StickerPack>();
+            }
+            System.out.println(stickerPacks);
+            return (List)stickerPacks;
         }
-        return stickerPackList;
+        catch (Exception e) {
+            return (List)new ArrayList<StickerPack>();
+        }
     }
 
     private Cursor getPackForAllStickerPacks(@NonNull Uri uri) {
@@ -219,9 +253,11 @@ public class StickerContentProvider extends ContentProvider {
         return cursor;
     }
 
-    private AssetFileDescriptor getImageAsset(Uri uri) throws IllegalArgumentException {
+    private AssetFileDescriptor getImageAsset(Uri uri) throws IllegalArgumentException, IOException {
+        System.out.println("uri " +uri.toString());
         AssetManager am = Objects.requireNonNull(getContext()).getAssets();
         final List<String> pathSegments = uri.getPathSegments();
+        System.out.println("pathSegments " +pathSegments);
         if (pathSegments.size() != 3) {
             throw new IllegalArgumentException("path segments should be 3, uri is: " + uri);
         }
@@ -235,13 +271,17 @@ public class StickerContentProvider extends ContentProvider {
         }
         //making sure the file that is trying to be fetched is in the list of stickers.
         for (StickerPack stickerPack : getStickerPackList()) {
+            System.out.println("fileName " +fileName + " size:"+stickerPack.getStickers().size());
             if (identifier.equals(stickerPack.identifier)) {
+
+
                 if (fileName.equals(stickerPack.trayImageFile)) {
                     return fetchFile(uri, am, fileName, identifier);
                 } else {
                     for (Sticker sticker : stickerPack.getStickers()) {
+                        System.out.println("fileName " +fileName + " == "+sticker.imageFileName+ " "+sticker.size);
                         if (fileName.equals(sticker.imageFileName)) {
-                            return fetchFile(uri, am, fileName, identifier);
+                            // return fetchFile(uri, am, fileName, identifier);
                         }
                     }
                 }
@@ -250,13 +290,21 @@ public class StickerContentProvider extends ContentProvider {
         return null;
     }
 
-    private AssetFileDescriptor fetchFile(@NonNull Uri uri, @NonNull AssetManager am, @NonNull String fileName, @NonNull String identifier) {
-        try {
-            return am.openFd(identifier + "/" + fileName);
-        } catch (IOException e) {
-            Log.e(Objects.requireNonNull(getContext()).getPackageName(), "IOException when getting asset file, uri:" + uri, e);
-            return null;
+    private AssetFileDescriptor fetchFile(@NonNull Uri uri, @NonNull AssetManager am, @NonNull String fileName, @NonNull String identifier) throws IOException {
+        final File cacheFile = getContext().getFilesDir();
+        final File file = new File(cacheFile, fileName);
+        try (final InputStream in = am.open(identifier + "/" + fileName);
+             final FileOutputStream out = new FileOutputStream(file)) {
+            byte[] buffer = new byte[1024];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+            }
         }
+        //The code above is basically copying the assets to storage, and servering the file off of the storage.
+        //If you have the files already downloaded/fetched, you could simply replace above part, and initialize the file parameter with your own file which points to the desired file.
+        //The key here is you can use ParcelFileDescriptor to create an AssetFileDescriptor.
+        return new AssetFileDescriptor(ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY), 0, AssetFileDescriptor.UNKNOWN_LENGTH);
     }
 
 
